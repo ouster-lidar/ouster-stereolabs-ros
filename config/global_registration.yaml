@@ -1,0 +1,52 @@
+# Parameters of the ouster_zed global_registration node.
+# Distances in meters. See src/global_registration_node.cpp for details.
+global_registration:
+  ros__parameters:
+    ouster_topic: /ouster/points
+    zed_topic: /zed/zed_node/point_cloud/cloud_registered
+
+    # Frames whose poses ouster_zed.launch.py sets (base_frame -> *)
+    base_frame: base_link
+    ouster_frame: os_sensor
+    zed_frame: zed_camera_link
+    # Sensor that keeps its current pose; the other one is moved onto it
+    reference_sensor: ouster
+
+    # ApproximateTime pairing; needs both drivers stamping with the same clock
+    sync_queue_size: 10
+    sync_max_interval: 0.05
+
+    # Range crop, in each sensor's own frame
+    ouster_min_range: 0.5
+    ouster_max_range: 20.0
+    zed_min_range: 0.3
+    zed_max_range: 10.0  # stereo depth gets noisy far away
+
+    # Pipeline: voxel grid -> normals -> FPFH
+    voxel_leaf_size: 0.1
+    normal_radius: 0.3   # ~3x voxel_leaf_size
+    feature_radius: 0.6  # ~2x normal_radius
+    num_threads: 0       # 0 = all cores
+
+    # SAC-IA
+    sac_max_iterations: 1000
+    sac_num_samples: 3
+    sac_correspondence_randomness: 10
+    sac_min_sample_distance: 0.5
+    sac_max_correspondence_distance: 0.5
+
+    # ICP refinement seeded with the SAC-IA result
+    icp_refine: true
+    icp_max_iterations: 50
+    icp_max_correspondence_distance: 0.3
+
+    inlier_distance: 0.1  # for the reported overlap score
+    # Runs agreeing within these bounds form the consensus that gets reported
+    consensus_translation: 0.1  # [m]
+    consensus_rotation: 5.0     # [deg]
+    min_agreeing_runs: 3        # consensus size needed before a result is saved
+    target_agreeing_runs: 10    # stop once this many runs agree; 0 = never stop
+    # Where the consensus poses are saved (set by the launch files); empty = don't save
+    calibration_file: ""
+    period: 5.0           # seconds between registrations
+    max_runs: 0           # 0 = keep running
