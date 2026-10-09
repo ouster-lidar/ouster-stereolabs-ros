@@ -122,17 +122,31 @@ Visualization Manager:
       Use rainbow: true
       Value: true
     - Class: rviz_default_plugins/MarkerArray
-      Enabled: false
+      Enabled: true
       Name: Ouster ZoneMarkers
       Namespaces:
-        {}
+        ouster_zone_labels: true
+        ouster_zones: true
       Topic:
         Depth: 5
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Best Effort
         Value: /ouster/zone_markers
-      Value: false
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: ZED ZoneMarkers
+      Namespaces:
+        zed_zone_labels: true
+        zed_zones: true
+      Topic:
+        Depth: 5
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /zone_monitor/zones/markers
+      Value: true
     - Alpha: 1
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
@@ -187,7 +201,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 9.061483383178711
+      Distance: 6.140080451965332
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1

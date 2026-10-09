@@ -18,11 +18,18 @@ writes them to calibration_file, so later launches start pre-calibrated.
 
 Because a TF frame can only have one parent, the ZED node's own
 odom -> zed_camera_link publishing is disabled here.
+
+With zone_monitor_config_file:=<zip> the Ouster zone monitor configuration is
+uploaded to the lidar and the same zip is loaded by a zed_zone_monitor node,
+which turns on ZED object detection. Both express the zones in os_sensor, so
+the lidar's zone markers and the camera's land on the same volumes through the
+calibration above.
 """
 
 import os
 
 import yaml
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
@@ -103,6 +110,89 @@ def sensor_transforms(context):
     return actions
 
 
+def scoped(include):
+    """Arguments passed to an include leak into this launch file's own
+    configuration unless the include is scoped; without this, the ouster
+    include's viz:=false would switch off the shared rviz."""
+    return GroupAction([include], scoped=True)
+
+
+def zone_monitor_config(context):
+    """Absolute path of zone_monitor_config_file, or '' when it is not set."""
+    path = LaunchConfiguration('zone_monitor_config_file').perform(context)
+    if not path:
+        return ''
+    path = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isfile(path):
+        raise RuntimeError(f'zone_monitor_config_file "{path}" does not exist')
+    return path
+
+
+def ouster_driver(context):
+    """The Ouster driver, uploading the zone monitor configuration if one is given."""
+    return [scoped(IncludeLaunchDescription(
+        XMLLaunchDescriptionSource(PathJoinSubstitution(
+            [FindPackageShare('ouster_ros'), 'launch', 'sensor.launch.xml'])),
+        launch_arguments={
+            'ouster_ns': LaunchConfiguration('ouster_ns'),
+            'sensor_hostname': LaunchConfiguration('sensor_hostname'),
+            'proc_mask': LaunchConfiguration('proc_mask'),
+            'lidar_port': LaunchConfiguration('lidar_port'),
+            'imu_port': LaunchConfiguration('imu_port'),
+            'zone_port': LaunchConfiguration('zone_port'),
+            'timestamp_mode': LaunchConfiguration('timestamp_mode'),
+            'zone_monitor_config_file': zone_monitor_config(context),
+            # the shared rviz below replaces the driver's own
+            'viz': 'false',
+        }.items(),
+    ))]
+
+
+def zed_camera(context):
+    """The ZED node, with object detection on when the zone monitor needs it."""
+    launch_arguments = {
+        'camera_model': LaunchConfiguration('camera_model'),
+        'camera_name': LaunchConfiguration('camera_name'),
+        # base_frame -> zed_camera_link is published by sensor_transforms instead
+        'publish_tf': 'false',
+    }
+    if zone_monitor_config(context):
+        launch_arguments['ros_params_override_path'] = os.path.join(
+            get_package_share_directory('zed_zone_monitor'), 'config',
+            'zed_od_override.yaml')
+    return [scoped(IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(PathJoinSubstitution(
+            [FindPackageShare('zed_wrapper'), 'launch', 'zed_camera.launch.py'])),
+        launch_arguments=launch_arguments.items(),
+    ))]
+
+
+def zed_zone_monitor(context):
+    """Monitor the lidar's zones with the ZED detections, in the lidar's frame."""
+    path = zone_monitor_config(context)
+    if not path:
+        return [LogInfo(msg='zone_monitor_config_file is not set; zed_zone_monitor is not '
+                            'started')]
+    camera_name = LaunchConfiguration('camera_name').perform(context)
+    return [Node(
+        package='zed_zone_monitor',
+        executable='zone_monitor',
+        name='zone_monitor',
+        output='screen',
+        parameters=[
+            os.path.join(get_package_share_directory('zed_zone_monitor'), 'config',
+                         'zone_monitor.yaml'),
+            {
+                'zone_monitor_config_file': path,
+                # the frame ouster-ros renders its zone markers in
+                'zone_monitor_frame_id': 'os_sensor',
+                'cameras': [camera_name],
+                'objects_topics': [f'/{camera_name}/zed_node/obj_det/objects'],
+            },
+        ],
+    )]
+
+
 def generate_launch_description():
     args = [
         # Ouster
@@ -118,6 +208,11 @@ def generate_launch_description():
             'timestamp_mode', default_value='TIME_FROM_ROS_TIME',
             description='Ouster timestamp mode; ROS time puts both sensors on the same clock '
                         '(the sensor default TIME_FROM_INTERNAL_OSC counts from power-up)'),
+        DeclareLaunchArgument(
+            'zone_monitor_config_file', default_value='',
+            description='Ouster zone monitor configuration zip (metadata.json + STL files). '
+                        'When set it is uploaded to the lidar and a zed_zone_monitor node '
+                        'monitors the same zones with the ZED detections'),
         # ZED
         DeclareLaunchArgument('camera_model', default_value='zed2i',
                               description='ZED camera model'),
@@ -149,33 +244,6 @@ def generate_launch_description():
             description='rviz config file'),
     ]
 
-    ouster = IncludeLaunchDescription(
-        XMLLaunchDescriptionSource(PathJoinSubstitution(
-            [FindPackageShare('ouster_ros'), 'launch', 'sensor.launch.xml'])),
-        launch_arguments={
-            'ouster_ns': LaunchConfiguration('ouster_ns'),
-            'sensor_hostname': LaunchConfiguration('sensor_hostname'),
-            'proc_mask': LaunchConfiguration('proc_mask'),
-            'lidar_port': LaunchConfiguration('lidar_port'),
-            'imu_port': LaunchConfiguration('imu_port'),
-            'zone_port': LaunchConfiguration('zone_port'),
-            'timestamp_mode': LaunchConfiguration('timestamp_mode'),
-            # the shared rviz below replaces the driver's own
-            'viz': 'false',
-        }.items(),
-    )
-
-    zed = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(PathJoinSubstitution(
-            [FindPackageShare('zed_wrapper'), 'launch', 'zed_camera.launch.py'])),
-        launch_arguments={
-            'camera_model': LaunchConfiguration('camera_model'),
-            'camera_name': LaunchConfiguration('camera_name'),
-            # base_frame -> zed_camera_link is published by sensor_transforms instead
-            'publish_tf': 'false',
-        }.items(),
-    )
-
     registration = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(PathJoinSubstitution(
             [FindPackageShare('ouster_zed'), 'launch', 'global_registration.launch.py'])),
@@ -197,12 +265,7 @@ def generate_launch_description():
         arguments=['-d', LaunchConfiguration('rviz_config')],
     )
 
-    # Arguments passed to an include leak into this launch file's own
-    # configuration unless the include is scoped; without this, the ouster
-    # include's viz:=false would switch off the shared rviz below.
-    def scoped(include):
-        return GroupAction([include], scoped=True)
-
     return LaunchDescription(args + [
-        scoped(ouster), scoped(zed), OpaqueFunction(function=sensor_transforms),
-        scoped(registration), rviz])
+        OpaqueFunction(function=ouster_driver), OpaqueFunction(function=zed_camera),
+        OpaqueFunction(function=sensor_transforms), scoped(registration),
+        OpaqueFunction(function=zed_zone_monitor), rviz])
