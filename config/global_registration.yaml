@@ -40,12 +40,22 @@ global_registration:
     icp_max_iterations: 50
     icp_max_correspondence_distance: 0.3
 
+    # Once the global stage has a consensus (min_agreeing_runs), skip SAC-IA and
+    # refine each new pair with coarse-to-fine point-to-plane ICP seeded from it
+    refine: true
+    refine_voxel_leaf_size: 0.05
+    refine_normal_radius: 0.25
+    refine_max_correspondence_distances: [0.3, 0.15, 0.08]  # one ICP pass each
+    refine_max_iterations: 30
+    refine_consensus_translation: 0.03  # [m]
+    refine_consensus_rotation: 1.0      # [deg]
+
     inlier_distance: 0.1  # for the reported overlap score
     # Runs agreeing within these bounds form the consensus that gets reported
     consensus_translation: 0.1  # [m]
     consensus_rotation: 5.0     # [deg]
-    min_agreeing_runs: 3        # consensus size needed before a result is saved
-    target_agreeing_runs: 10    # stop once this many runs agree; 0 = never stop
+    min_agreeing_runs: 3        # consensus size needed before a result is trusted and saved
+    target_agreeing_runs: 10    # stop once this many (refined, if refine) runs agree; 0 = never
     # Where the consensus poses are saved (set by the launch files); empty = don't save
     calibration_file: ""
     period: 5.0           # seconds between registrations

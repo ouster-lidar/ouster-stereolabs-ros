@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 
+#include <pcl/common/io.h>
 #include <pcl/common/transforms.h>
 #include <pcl/features/fpfh_omp.h>
 #include <pcl/features/normal_3d_omp.h>
@@ -122,6 +123,18 @@ void GlobalRegistrationNode::declare_params()
   p.icp_max_correspondence_distance =
     declare_parameter<double>("icp_max_correspondence_distance", 0.3);
 
+  p.refine = declare_parameter<bool>("refine", true);
+  p.refine_voxel_leaf_size = declare_parameter<double>("refine_voxel_leaf_size", 0.05);
+  p.refine_normal_radius = declare_parameter<double>("refine_normal_radius", 0.25);
+  p.refine_max_correspondence_distances = declare_parameter<std::vector<double>>(
+    "refine_max_correspondence_distances", {0.3, 0.15, 0.08});
+  if (p.refine_max_correspondence_distances.empty()) {
+    throw std::invalid_argument("refine_max_correspondence_distances must not be empty");
+  }
+  p.refine_max_iterations = declare_parameter<int>("refine_max_iterations", 30);
+  p.refine_consensus_translation = declare_parameter<double>("refine_consensus_translation", 0.03);
+  p.refine_consensus_rotation = declare_parameter<double>("refine_consensus_rotation", 1.0);
+
   p.inlier_distance = declare_parameter<double>("inlier_distance", 0.1);
   p.consensus_translation = declare_parameter<double>("consensus_translation", 0.1);
   p.consensus_rotation = declare_parameter<double>("consensus_rotation", 5.0);
@@ -133,7 +146,7 @@ void GlobalRegistrationNode::declare_params()
   p.max_runs = declare_parameter<int>("max_runs", 0);
 }
 
-std::optional<Eigen::Isometry3d> GlobalRegistrationNode::lookup(const std::string & frame) const
+std::optional<Eigen::Isometry3d> GlobalRegistrationNode::lookup(const std::string & frame)
 {
   try {
     // All frames involved are static, so the latest transform is the right one.
@@ -226,6 +239,62 @@ GlobalRegistrationNode::PreparedCloud GlobalRegistrationNode::prepare(
   return out;
 }
 
+GlobalRegistrationNode::NormalCloud::Ptr GlobalRegistrationNode::prepare_refine(
+  const Cloud::ConstPtr & cloud, const Eigen::Vector3d & viewpoint) const
+{
+  auto down = std::make_shared<Cloud>();
+  pcl::VoxelGrid<PointT> voxel;
+  voxel.setInputCloud(cloud);
+  const auto leaf = static_cast<float>(params_.refine_voxel_leaf_size);
+  voxel.setLeafSize(leaf, leaf, leaf);
+  voxel.filter(*down);
+
+  auto normals = std::make_shared<Normals>();
+  pcl::NormalEstimationOMP<PointT, pcl::Normal> ne(params_.num_threads);
+  ne.setInputCloud(down);
+  ne.setSearchMethod(std::make_shared<pcl::search::KdTree<PointT>>());
+  ne.setRadiusSearch(params_.refine_normal_radius);
+  ne.setViewPoint(viewpoint.x(), viewpoint.y(), viewpoint.z());
+  ne.compute(*normals);
+
+  auto out = std::make_shared<NormalCloud>();
+  out->reserve(down->size());
+  for (std::size_t i = 0; i < down->size(); ++i) {
+    const auto & n = (*normals)[i];
+    if (!pcl::isFinite(n)) {continue;}
+    pcl::PointNormal pn;
+    pn.getVector3fMap() = (*down)[i].getVector3fMap();
+    pn.getNormalVector3fMap() = n.getNormalVector3fMap();
+    pn.curvature = n.curvature;
+    out->push_back(pn);
+  }
+  return out;
+}
+
+std::optional<Eigen::Isometry3d> GlobalRegistrationNode::refine_icp(
+  const NormalCloud::ConstPtr & source, const NormalCloud::ConstPtr & target,
+  const Eigen::Isometry3d & seed) const
+{
+  // Point-to-plane: the lidar samples surfaces along widely spaced rings, so
+  // point-to-point matching against the dense stereo cloud is biased across
+  // the rings; sliding along the lidar's local planes is not penalized here.
+  Eigen::Matrix4f guess = seed.matrix().cast<float>();
+  for (double max_dist : params_.refine_max_correspondence_distances) {
+    pcl::IterativeClosestPointWithNormals<pcl::PointNormal, pcl::PointNormal> icp;
+    icp.setInputSource(source);
+    icp.setInputTarget(target);
+    icp.setMaxCorrespondenceDistance(max_dist);
+    icp.setMaximumIterations(params_.refine_max_iterations);
+    icp.setTransformationEpsilon(1e-9);
+    icp.setEuclideanFitnessEpsilon(1e-7);
+    NormalCloud aligned;
+    icp.align(aligned, guess);
+    if (!icp.hasConverged()) {return std::nullopt;}
+    guess = icp.getFinalTransformation();
+  }
+  return to_isometry(guess);
+}
+
 double GlobalRegistrationNode::inlier_ratio(const Cloud & source, const Cloud::ConstPtr & target,
                                             double max_dist)
 {
@@ -243,38 +312,50 @@ double GlobalRegistrationNode::inlier_ratio(const Cloud & source, const Cloud::C
   return static_cast<double>(inliers) / static_cast<double>(source.size());
 }
 
-std::pair<Eigen::Isometry3d, std::size_t> GlobalRegistrationNode::consensus() const
+GlobalRegistrationNode::Consensus GlobalRegistrationNode::consensus(
+  const std::vector<Eigen::Isometry3d> & estimates, double max_translation, double max_rotation)
 {
-  const double max_angle = params_.consensus_rotation * M_PI / 180.0;
   auto agree = [&](const Eigen::Isometry3d & a, const Eigen::Isometry3d & b) {
-      return (a.translation() - b.translation()).norm() < params_.consensus_translation &&
-             rotation_angle(a, b) < max_angle;
+      return (a.translation() - b.translation()).norm() < max_translation &&
+             rotation_angle(a, b) < max_rotation;
     };
 
   // Pick the estimate that agrees with the most others (O(n^2), n is small) ...
   std::size_t best = 0, best_count = 0;
-  for (std::size_t i = 0; i < estimates_.size(); ++i) {
+  for (std::size_t i = 0; i < estimates.size(); ++i) {
     std::size_t count = 0;
-    for (const auto & other : estimates_) {count += agree(estimates_[i], other);}
+    for (const auto & other : estimates) {count += agree(estimates[i], other);}
     if (count > best_count) {best = i; best_count = count;}
   }
 
   // ... and average its group. Rotations are close to each other, so a
   // sign-aligned normalized quaternion sum is an accurate mean.
+  std::vector<const Eigen::Isometry3d *> group;
+  for (const auto & e : estimates) {
+    if (agree(estimates[best], e)) {group.push_back(&e);}
+  }
   Eigen::Vector3d t_sum = Eigen::Vector3d::Zero();
   Eigen::Vector4d q_sum = Eigen::Vector4d::Zero();
-  const Eigen::Quaterniond q_ref(estimates_[best].rotation());
-  for (const auto & e : estimates_) {
-    if (!agree(estimates_[best], e)) {continue;}
-    Eigen::Quaterniond q(e.rotation());
+  const Eigen::Quaterniond q_ref(estimates[best].rotation());
+  for (const auto * e : group) {
+    Eigen::Quaterniond q(e->rotation());
     if (q.dot(q_ref) < 0.0) {q.coeffs() = -q.coeffs();}
-    t_sum += e.translation();
+    t_sum += e->translation();
     q_sum += q.coeffs();
   }
-  Eigen::Isometry3d mean = Eigen::Isometry3d::Identity();
-  mean.linear() = Eigen::Quaterniond(q_sum.normalized()).toRotationMatrix();
-  mean.translation() = t_sum / static_cast<double>(best_count);
-  return {mean, best_count};
+  Consensus out{Eigen::Isometry3d::Identity(), group.size(), 0.0, 0.0};
+  out.pose.linear() = Eigen::Quaterniond(q_sum.normalized()).toRotationMatrix();
+  out.pose.translation() = t_sum / static_cast<double>(group.size());
+
+  // Spread of the group around its mean, as a precision indicator.
+  double t_sq = 0.0, r_sq = 0.0;
+  for (const auto * e : group) {
+    t_sq += (e->translation() - out.pose.translation()).squaredNorm();
+    r_sq += std::pow(rotation_angle(*e, out.pose), 2);
+  }
+  out.translation_std = std::sqrt(t_sq / static_cast<double>(group.size()));
+  out.rotation_std = std::sqrt(r_sq / static_cast<double>(group.size()));
+  return out;
 }
 
 std::array<double, 6> GlobalRegistrationNode::to_xyzrpy(const Eigen::Isometry3d & pose)
@@ -306,7 +387,8 @@ std::string GlobalRegistrationNode::pose_as_launch_args(const std::string & pref
 
 bool GlobalRegistrationNode::save_calibration(const Eigen::Isometry3d & base_T_ouster,
                                               const Eigen::Isometry3d & base_T_zed,
-                                              std::size_t agreeing_runs) const
+                                              const Consensus & result,
+                                              const std::string & stage) const
 {
   namespace fs = std::filesystem;
   static constexpr const char * keys[] = {"x", "y", "z", "roll", "pitch", "yaw"};
@@ -323,9 +405,13 @@ bool GlobalRegistrationNode::save_calibration(const Eigen::Isometry3d & base_T_o
        << "stamp: \"" << std::put_time(&utc, "%Y-%m-%dT%H:%M:%SZ") << "\"\n"
        << "base_frame: " << params_.base_frame << "\n"
        << "reference_sensor: " << params_.reference_sensor << "\n"
-       << "agreeing_runs: " << agreeing_runs << "\n"
-       << "total_runs: " << estimates_.size() << "\n"
-       << std::fixed << std::setprecision(6);
+       << "stage: " << stage << "  # global (coarse) or refined\n"
+       << "agreeing_runs: " << result.count << "\n"
+       << "total_runs: " << (stage == "refined" ? refined_.size() : estimates_.size()) << "\n"
+       << std::fixed << std::setprecision(6)
+       << "# RMS spread of the agreeing runs around the saved pose\n"
+       << "translation_spread_m: " << result.translation_std << "\n"
+       << "rotation_spread_deg: " << result.rotation_std * 180.0 / M_PI << "\n";
   const std::pair<const char *, const Eigen::Isometry3d *> sensors[] = {
     {"ouster", &base_T_ouster}, {"zed", &base_T_zed}};
   for (const auto & [name, pose] : sensors) {
@@ -375,13 +461,108 @@ void GlobalRegistrationNode::on_clouds(const CloudMsg::ConstSharedPtr & ouster_m
   ++runs_;
   const auto t_start = Clock::now();
 
+  // correction: maps ZED points (in base_frame, current poses) onto the Ouster
+  // ones. After correction zed_in_base ~= ouster_in_base: either move the ZED
+  // by the correction, or keep the ZED and move the Ouster by its inverse. The
+  // sensors' internal transforms (e.g. zed_camera_link -> zed_left_camera_frame)
+  // are static, so correcting the cloud frame corrects the launch frame equally.
+  const bool zed_moves = params_.reference_sensor == "ouster";
+  const std::string moved = zed_moves ? "zed" : "ouster";
+  auto to_estimate = [&](const Eigen::Isometry3d & correction) -> Eigen::Isometry3d {
+      return zed_moves ? correction * *base_T_zed : correction.inverse() * *base_T_ouster;
+    };
+  auto to_correction = [&](const Eigen::Isometry3d & estimate) -> Eigen::Isometry3d {
+      return zed_moves ? estimate * base_T_zed->inverse() : *base_T_ouster * estimate.inverse();
+    };
+  auto new_poses = [&](const Eigen::Isometry3d & moved_pose) {
+      return std::make_pair(zed_moves ? *base_T_ouster : moved_pose,   // ouster
+                            zed_moves ? moved_pose : *base_T_zed);     // zed
+    };
+
   // ---- Convert + crop + express both clouds in base_frame -------------------
   const auto ouster_cloud = to_base_frame(*ouster_msg, *base_T_ouster_cloud,
                                           params_.ouster_min_range, params_.ouster_max_range);
   const auto zed_cloud = to_base_frame(*zed_msg, *base_T_zed_cloud,
                                        params_.zed_min_range, params_.zed_max_range);
 
-  // ---- Voxel grid, normals, FPFH --------------------------------------------
+  const double stamp_gap = std::abs(
+    (rclcpp::Time(ouster_msg->header.stamp) - rclcpp::Time(zed_msg->header.stamp)).seconds());
+  std::ostringstream out;
+  out << std::fixed;
+
+  if (refine_seed_) {
+    // ==== Refinement stage: point-to-plane ICP seeded from the global result ====
+    // Every run starts from the same global consensus, so the refined runs are
+    // independent samples and their spread is an honest precision estimate.
+    const auto target = prepare_refine(ouster_cloud, base_T_ouster_cloud->translation());
+    const auto source = prepare_refine(zed_cloud, base_T_zed_cloud->translation());
+    const auto correction = refine_icp(source, target, to_correction(*refine_seed_));
+    if (!correction) {
+      RCLCPP_WARN(get_logger(), "Refinement ICP did not converge, retrying on the next pair");
+      return;
+    }
+    Cloud source_xyz, target_xyz;
+    pcl::copyPointCloud(*source, source_xyz);
+    pcl::copyPointCloud(*target, target_xyz);
+    pcl::transformPointCloud(source_xyz, source_xyz, correction->matrix().cast<float>());
+    const double inliers = inlier_ratio(source_xyz, std::make_shared<Cloud>(target_xyz),
+                                        params_.inlier_distance);
+
+    const Eigen::Isometry3d estimate = to_estimate(*correction);
+    const Eigen::Isometry3d from_seed = refine_seed_->inverse() * estimate;
+    refined_.push_back(estimate);
+    const auto result = consensus(refined_, params_.refine_consensus_translation,
+                                  params_.refine_consensus_rotation * M_PI / 180.0);
+    const auto [new_base_T_ouster, new_base_T_zed] = new_poses(result.pose);
+
+    out << "\n========== Ouster <-> ZED registration, run " << runs_ << " (refinement "
+        << refined_.size() << ") ==========\n"
+        << std::setprecision(3) << "  pair stamp gap : " << stamp_gap << " s\n"
+        << "  points         : ouster " << target->size() << ", zed " << source->size()
+        << " (voxel " << std::setprecision(2) << params_.refine_voxel_leaf_size << " m)\n"
+        << "  ICP            : point-to-plane, " << std::setprecision(1) << 100.0 * inliers
+        << "% inliers, " << std::setprecision(2) << seconds_since(t_start) << " s\n"
+        << "  vs global      : " << std::setprecision(1)
+        << 1000.0 * from_seed.translation().norm() << " mm, " << std::setprecision(2)
+        << Eigen::AngleAxisd(from_seed.rotation()).angle() * 180.0 / M_PI << " deg\n"
+        << "  this run       : " << pose_as_launch_args(moved, estimate) << "\n"
+        << "  consensus      : " << result.count << " of " << refined_.size()
+        << " refined runs agree (within " << std::setprecision(0)
+        << 1000.0 * params_.refine_consensus_translation << " mm / " << std::setprecision(1)
+        << params_.refine_consensus_rotation << " deg), spread " << std::setprecision(1)
+        << 1000.0 * result.translation_std << " mm / " << std::setprecision(2)
+        << result.rotation_std * 180.0 / M_PI << " deg RMS\n";
+    const bool trusted = result.count >= static_cast<std::size_t>(params_.min_agreeing_runs);
+    if (!trusted) {
+      out << "  (not reliable yet: waiting for at least " << params_.min_agreeing_runs
+          << " agreeing refined runs)\n";
+    } else if (!params_.calibration_file.empty() &&
+      save_calibration(new_base_T_ouster, new_base_T_zed, result, "refined"))
+    {
+      out << "  saved to       : " << params_.calibration_file << "\n";
+    }
+    out << "  Relaunch with the consensus:\n"
+        << "    ros2 launch ouster_zed ouster_zed.launch.py \\\n"
+        << "      " << pose_as_launch_args("ouster", new_base_T_ouster) << " \\\n"
+        << "      " << pose_as_launch_args("zed", new_base_T_zed) << "\n";
+    RCLCPP_INFO(get_logger(), "%s", out.str().c_str());
+
+    if (params_.target_agreeing_runs > 0 &&
+      result.count >= static_cast<std::size_t>(params_.target_agreeing_runs))
+    {
+      done_ = true;
+      RCLCPP_INFO(get_logger(), "Calibration complete (%zu of %zu refined runs agree, spread "
+                  "%.1f mm / %.2f deg RMS)%s%s", result.count, refined_.size(),
+                  1000.0 * result.translation_std, result.rotation_std * 180.0 / M_PI,
+                  params_.calibration_file.empty() ? "" : ", saved to ",
+                  params_.calibration_file.c_str());
+    } else if (params_.max_runs > 0 && runs_ >= params_.max_runs) {
+      RCLCPP_INFO(get_logger(), "Reached max_runs=%d, no further registrations", params_.max_runs);
+    }
+    return;
+  }
+
+  // ==== Global stage: voxel grid, normals, FPFH, SAC-IA, ICP ====================
   const auto target = prepare(ouster_cloud, base_T_ouster_cloud->translation());
   const auto source = prepare(zed_cloud, base_T_zed_cloud->translation());
   const double t_features = seconds_since(t_start);
@@ -416,7 +597,6 @@ void GlobalRegistrationNode::on_clouds(const CloudMsg::ConstSharedPtr & ouster_m
     RCLCPP_WARN(get_logger(), "SAC-IA did not converge, retrying on the next pair");
     return;
   }
-  // correction: maps ZED points (in base_frame, current poses) onto the Ouster ones
   Eigen::Isometry3d correction = to_isometry(sac.getFinalTransformation());
   const double sac_fitness = sac.getFitnessScore(params_.sac_max_correspondence_distance);
   const double sac_inliers = inlier_ratio(sac_aligned, target.points, params_.inlier_distance);
@@ -451,26 +631,14 @@ void GlobalRegistrationNode::on_clouds(const CloudMsg::ConstSharedPtr & ouster_m
   }
 
   // ---- Corrected sensor poses -----------------------------------------------
-  // After correction:  zed_in_base ~= ouster_in_base. Either move the ZED by the
-  // correction, or keep the ZED and move the Ouster by its inverse. The sensors'
-  // internal transforms (e.g. zed_camera_link -> zed_left_camera_frame) are
-  // static, so correcting the cloud frame corrects the launch frame equally.
-  const bool zed_moves = params_.reference_sensor == "ouster";
-  const Eigen::Isometry3d estimate = zed_moves ?
-    correction * *base_T_zed : correction.inverse() * *base_T_ouster;
+  const Eigen::Isometry3d estimate = to_estimate(correction);
   estimates_.push_back(estimate);
-  const auto [agreed_pose, agreed_count] = consensus();
-  const Eigen::Isometry3d & new_base_T_zed = zed_moves ? agreed_pose : *base_T_zed;
-  const Eigen::Isometry3d & new_base_T_ouster = zed_moves ? *base_T_ouster : agreed_pose;
-  const std::string moved = zed_moves ? "zed" : "ouster";
-
-  const double stamp_gap = std::abs(
-    (rclcpp::Time(ouster_msg->header.stamp) - rclcpp::Time(zed_msg->header.stamp)).seconds());
+  const auto result = consensus(estimates_, params_.consensus_translation,
+                                params_.consensus_rotation * M_PI / 180.0);
+  const auto [new_base_T_ouster, new_base_T_zed] = new_poses(result.pose);
   const Eigen::AngleAxisd delta_rot(correction.rotation());
 
-  std::ostringstream out;
-  out << std::fixed
-      << "\n========== Ouster <-> ZED global registration, run " << runs_ << " ==========\n"
+  out << "\n========== Ouster <-> ZED global registration, run " << runs_ << " ==========\n"
       << std::setprecision(3) << "  pair stamp gap : " << stamp_gap << " s\n"
       << "  points         : ouster " << ouster_msg->width * ouster_msg->height << " raw -> "
       << ouster_cloud->size() << " cropped -> " << target.points->size() << " with features\n"
@@ -487,16 +655,16 @@ void GlobalRegistrationNode::on_clouds(const CloudMsg::ConstSharedPtr & ouster_m
       << "  inliers = share of ZED points within " << std::setprecision(2)
       << params_.inlier_distance << " m of an Ouster point\n"
       << "  this run       : " << pose_as_launch_args(moved, estimate) << "\n"
-      << "  consensus      : " << agreed_count << " of " << estimates_.size()
+      << "  consensus      : " << result.count << " of " << estimates_.size()
       << " runs agree (within " << std::setprecision(2) << params_.consensus_translation
       << " m / " << std::setprecision(1) << params_.consensus_rotation << " deg); "
       << params_.reference_sensor << " pose kept fixed\n";
-  const bool trusted = agreed_count >= static_cast<std::size_t>(params_.min_agreeing_runs);
+  const bool trusted = result.count >= static_cast<std::size_t>(params_.min_agreeing_runs);
   if (!trusted) {
     out << "  (not reliable yet: waiting for at least " << params_.min_agreeing_runs
         << " agreeing runs)\n";
   } else if (!params_.calibration_file.empty() &&
-    save_calibration(new_base_T_ouster, new_base_T_zed, agreed_count))
+    save_calibration(new_base_T_ouster, new_base_T_zed, result, "global"))
   {
     out << "  saved to       : " << params_.calibration_file << "\n";
   }
@@ -508,18 +676,22 @@ void GlobalRegistrationNode::on_clouds(const CloudMsg::ConstSharedPtr & ouster_m
     out << "  WARNING: low overlap, this run is likely wrong. Make sure both sensors see\n"
         << "  the same structured scene, or tune voxel_leaf_size / feature_radius.\n";
   }
+  if (trusted && params_.refine) {
+    refine_seed_ = result.pose;
+    out << "  Global result trusted: refining it with point-to-plane ICP from now on\n";
+  }
   RCLCPP_INFO(get_logger(), "%s", out.str().c_str());
 
-  if (params_.target_agreeing_runs > 0 &&
-    agreed_count >= static_cast<std::size_t>(params_.target_agreeing_runs))
+  if (!params_.refine && params_.target_agreeing_runs > 0 &&
+    result.count >= static_cast<std::size_t>(params_.target_agreeing_runs))
   {
     done_ = true;
     if (params_.calibration_file.empty()) {
       RCLCPP_INFO(get_logger(), "Calibration complete (%zu of %zu runs agree); "
-                  "no further registrations", agreed_count, estimates_.size());
+                  "no further registrations", result.count, estimates_.size());
     } else {
       RCLCPP_INFO(get_logger(), "Calibration complete (%zu of %zu runs agree), saved to '%s'. "
-                  "Relaunch without register:=true to use it.", agreed_count, estimates_.size(),
+                  "Relaunch without register:=true to use it.", result.count, estimates_.size(),
                   params_.calibration_file.c_str());
     }
   } else if (params_.max_runs > 0 && runs_ >= params_.max_runs) {
