@@ -48,6 +48,7 @@ from launch_xml.launch_description_sources import XMLLaunchDescriptionSource
 
 POSE_KEYS = ('x', 'y', 'z', 'roll', 'pitch', 'yaw')
 DEFAULT_CALIBRATION_FILE = os.path.join('~', '.ros', 'ouster_zed', 'calibration.yaml')
+REGISTRATION_ZED_OVERRIDES = 'depth.depth_mode:=NEURAL_PLUS;depth.depth_confidence:=50'
 
 
 def pose_args(prefix, frame):
@@ -156,6 +157,10 @@ def zed_camera(context):
         # base_frame -> zed_camera_link is published by sensor_transforms instead
         'publish_tf': 'false',
     }
+    overrides = LaunchConfiguration('zed_param_overrides').perform(context)
+    if not overrides and LaunchConfiguration('register').perform(context).lower() == 'true':
+        overrides = REGISTRATION_ZED_OVERRIDES
+    launch_arguments['param_overrides'] = overrides
     if zone_monitor_config(context):
         launch_arguments['ros_params_override_path'] = os.path.join(
             get_package_share_directory('zed_zone_monitor'), 'config',
@@ -218,6 +223,11 @@ def generate_launch_description():
                               description='ZED camera model'),
         DeclareLaunchArgument('camera_name', default_value='zed',
                               description='ZED camera name (prefix of its TF frames)'),
+        DeclareLaunchArgument(
+            'zed_param_overrides', default_value='',
+            description='ZED node parameter overrides, as semicolon-separated key:=value '
+                        'pairs, e.g. "depth.depth_mode:=NEURAL;depth.depth_confidence:=50". '
+                        f'Empty with register:=true means "{REGISTRATION_ZED_OVERRIDES}"'),
         # Mounting poses relative to base_frame
         DeclareLaunchArgument('base_frame', default_value='base_link',
                               description='common parent frame of both sensors'),

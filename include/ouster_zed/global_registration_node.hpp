@@ -32,6 +32,11 @@ namespace ouster_zed {
  *
  *   voxel grid -> normals -> FPFH -> SAC-IA (global) -> ICP (optional refine)
  *
+ * Once `min_agreeing_runs` global runs agree, the expensive global stage is
+ * skipped: each new pair is only refined with a coarse-to-fine point-to-plane
+ * ICP seeded from the current consensus, on a finer voxel grid. The reported
+ * and saved result is then the (much tighter) consensus of these refined runs.
+ *
  * Both clouds are first expressed in `base_frame` using the poses currently
  * published by ouster_zed.launch.py, so the estimate is a *correction* on top
  * of those poses. The corrected poses are printed as launch arguments ready to
@@ -51,6 +56,7 @@ private:
   using Cloud = pcl::PointCloud<PointT>;
   using Normals = pcl::PointCloud<pcl::Normal>;
   using Features = pcl::PointCloud<pcl::FPFHSignature33>;
+  using NormalCloud = pcl::PointCloud<pcl::PointNormal>;
   using CloudMsg = sensor_msgs::msg::PointCloud2;
   using SyncPolicy = message_filters::sync_policies::ApproximateTime<CloudMsg, CloudMsg>;
   using Clock = std::chrono::steady_clock;
@@ -92,6 +98,14 @@ private:
     int icp_max_iterations;
     double icp_max_correspondence_distance;  // [m]
 
+    bool refine;  // switch to ICP-only refinement once the global stage has a consensus
+    double refine_voxel_leaf_size;  // [m]
+    double refine_normal_radius;    // [m]
+    std::vector<double> refine_max_correspondence_distances;  // [m] coarse to fine ICP passes
+    int refine_max_iterations;      // per pass
+    double refine_consensus_translation;  // [m] agreement bounds of refined runs
+    double refine_consensus_rotation;     // [deg]
+
     double inlier_distance;  // [m] used for the reported overlap score
     double consensus_translation;  // [m] two runs agree if closer than this ...
     double consensus_rotation;     // [deg] ... and this
@@ -110,7 +124,7 @@ private:
                  const CloudMsg::ConstSharedPtr & zed_msg);
 
   /// base_frame <- frame, from the (static) TF tree. std::nullopt if unavailable.
-  std::optional<Eigen::Isometry3d> lookup(const std::string & frame) const;
+  std::optional<Eigen::Isometry3d> lookup(const std::string & frame);
 
   /// Convert to PCL, drop invalid/out-of-range points and express in base_frame.
   static Cloud::Ptr to_base_frame(const CloudMsg & msg, const Eigen::Isometry3d & base_T_cloud,
@@ -119,16 +133,36 @@ private:
   /// Voxel grid + normal estimation + FPFH. `viewpoint` orients the normals.
   PreparedCloud prepare(const Cloud::ConstPtr & cloud, const Eigen::Vector3d & viewpoint) const;
 
+  /// Voxel grid + normals oriented towards `viewpoint`, for point-to-plane ICP.
+  NormalCloud::Ptr prepare_refine(const Cloud::ConstPtr & cloud,
+                                  const Eigen::Vector3d & viewpoint) const;
+
+  /// Coarse-to-fine point-to-plane ICP of `source` onto `target` starting from
+  /// `seed`. std::nullopt if a pass does not converge.
+  std::optional<Eigen::Isometry3d> refine_icp(const NormalCloud::ConstPtr & source,
+                                              const NormalCloud::ConstPtr & target,
+                                              const Eigen::Isometry3d & seed) const;
+
   /// Fraction of `source` points having a `target` neighbour closer than `max_dist`.
   static double inlier_ratio(const Cloud & source, const Cloud::ConstPtr & target,
                              double max_dist);
 
-  /// Largest group of mutually agreeing estimates in `estimates_` and its mean pose.
-  std::pair<Eigen::Isometry3d, std::size_t> consensus() const;
+  struct Consensus
+  {
+    Eigen::Isometry3d pose;  // mean of the group
+    std::size_t count;       // group size
+    double translation_std;  // [m] RMS distance of the group members to the mean
+    double rotation_std;     // [rad] RMS angle of the group members to the mean
+  };
+
+  /// Largest group of mutually agreeing `estimates` (within `max_translation`
+  /// [m] / `max_rotation` [rad]) and its mean pose.
+  static Consensus consensus(const std::vector<Eigen::Isometry3d> & estimates,
+                             double max_translation, double max_rotation);
 
   /// Write both sensor poses to params_.calibration_file (atomically). False on failure.
   bool save_calibration(const Eigen::Isometry3d & base_T_ouster, const Eigen::Isometry3d & base_T_zed,
-                        std::size_t agreeing_runs) const;
+                        const Consensus & result, const std::string & stage) const;
 
   /// {x, y, z, roll, pitch, yaw} of a pose, with the RPY convention of
   /// tf2 static_transform_publisher.
@@ -151,6 +185,10 @@ private:
   /// SAC-IA is randomized and may occasionally lock onto a wrong alignment, so
   /// the reported result is the consensus over runs rather than the last one.
   std::vector<Eigen::Isometry3d> estimates_;
+  /// Same, from the refinement stage (seeded from the global consensus).
+  std::vector<Eigen::Isometry3d> refined_;
+  /// Global consensus pose that seeds the refinement; set once it is trusted.
+  std::optional<Eigen::Isometry3d> refine_seed_;
 
   std::optional<Clock::time_point> last_run_;
   int runs_ = 0;
