@@ -1,7 +1,8 @@
 // Copyright 2026 Ouster, Inc.
 //
 // Global (initial-guess-free) extrinsic registration between the Ouster lidar
-// and the ZED camera point clouds, using the PCL FPFH + SAC-IA pipeline.
+// and the ZED camera point clouds, using PCL FPFH features and either prerejective
+// RANSAC (default) or SAC-IA.
 
 #pragma once
 
@@ -30,7 +31,7 @@ namespace ouster_zed {
  * Subscribes to the Ouster and ZED point clouds, pairs them by timestamp and
  * estimates the rigid transform that aligns them:
  *
- *   voxel grid -> normals -> FPFH -> SAC-IA (global) -> ICP (optional refine)
+ *   voxel grid -> normals -> FPFH -> RANSAC or SAC-IA (global, parallel) -> ICP (optional refine)
  *
  * Once `min_agreeing_runs` global runs agree, the expensive global stage is
  * skipped: each new pair is only refined with a coarse-to-fine point-to-plane
@@ -88,11 +89,21 @@ private:
     double feature_radius;   // [m] must be larger than normal_radius
     int num_threads;         // 0 = use all cores
 
-    int sac_max_iterations;
-    int sac_num_samples;
-    int sac_correspondence_randomness;
-    double sac_min_sample_distance;       // [m]
-    double sac_max_correspondence_distance;  // [m]
+    std::string global_method;  // "ransac" (prerejective RANSAC) or "sac_ia"
+    int global_attempts;  // parallel global attempts per pair, the best one is kept
+
+    int ransac_max_iterations;
+    int ransac_num_samples;
+    int ransac_correspondence_randomness;
+    double ransac_similarity_threshold;         // [0, 1) edge length ratio to keep a sample
+    double ransac_max_correspondence_distance;  // [m]
+    double ransac_inlier_fraction;              // share of ZED points that must match
+
+    int sac_ia_max_iterations;
+    int sac_ia_num_samples;
+    int sac_ia_correspondence_randomness;
+    double sac_ia_min_sample_distance;          // [m]
+    double sac_ia_max_correspondence_distance;  // [m]
 
     bool icp_refine;
     int icp_max_iterations;
@@ -132,6 +143,20 @@ private:
 
   /// Voxel grid + normal estimation + FPFH. `viewpoint` orients the normals.
   PreparedCloud prepare(const Cloud::ConstPtr & cloud, const Eigen::Vector3d & viewpoint) const;
+
+  /// Result of one randomized global alignment attempt (RANSAC or SAC-IA + optional ICP).
+  struct GlobalAttempt
+  {
+    bool converged = false;
+    Eigen::Isometry3d correction = Eigen::Isometry3d::Identity();
+    double global_inliers = 0.0;  // overlap scores, see inlier_ratio()
+    double final_inliers = 0.0;
+    double global_s = 0.0;  // [s]
+    std::string icp_note;   // for the report
+  };
+
+  /// One global alignment attempt of `source` onto `target`. Thread-safe.
+  GlobalAttempt global_attempt(const PreparedCloud & source, const PreparedCloud & target) const;
 
   /// Voxel grid + normals oriented towards `viewpoint`, for point-to-plane ICP.
   NormalCloud::Ptr prepare_refine(const Cloud::ConstPtr & cloud,
@@ -182,7 +207,7 @@ private:
   std::shared_ptr<message_filters::Synchronizer<SyncPolicy>> sync_;
 
   /// Estimated base_frame pose of the moved (non-reference) sensor, one per run.
-  /// SAC-IA is randomized and may occasionally lock onto a wrong alignment, so
+  /// The global stage is randomized and may occasionally lock onto a wrong alignment, so
   /// the reported result is the consensus over runs rather than the last one.
   std::vector<Eigen::Isometry3d> estimates_;
   /// Same, from the refinement stage (seeded from the global consensus).

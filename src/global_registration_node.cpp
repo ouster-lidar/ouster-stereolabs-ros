@@ -2,11 +2,13 @@
 
 #include "ouster_zed/global_registration_node.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
@@ -21,6 +23,7 @@
 #include <pcl/kdtree/kdtree_flann.h>
 #include <pcl/registration/ia_ransac.h>
 #include <pcl/registration/icp.h>
+#include <pcl/registration/sample_consensus_prerejective.h>
 #include <pcl/search/kdtree.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <rclcpp_components/register_node_macro.hpp>
@@ -111,12 +114,28 @@ void GlobalRegistrationNode::declare_params()
   p.feature_radius = declare_parameter<double>("feature_radius", 0.6);
   p.num_threads = declare_parameter<int>("num_threads", 0);
 
-  p.sac_max_iterations = declare_parameter<int>("sac_max_iterations", 1000);
-  p.sac_num_samples = declare_parameter<int>("sac_num_samples", 3);
-  p.sac_correspondence_randomness = declare_parameter<int>("sac_correspondence_randomness", 10);
-  p.sac_min_sample_distance = declare_parameter<double>("sac_min_sample_distance", 0.5);
-  p.sac_max_correspondence_distance =
-    declare_parameter<double>("sac_max_correspondence_distance", 0.5);
+  p.global_method = declare_parameter<std::string>("global_method", "ransac");
+  if (p.global_method != "ransac" && p.global_method != "sac_ia") {
+    throw std::invalid_argument("global_method must be 'ransac' or 'sac_ia'");
+  }
+  p.global_attempts = declare_parameter<int>("global_attempts", 4);
+
+  p.ransac_max_iterations = declare_parameter<int>("ransac_max_iterations", 50000);
+  p.ransac_num_samples = declare_parameter<int>("ransac_num_samples", 3);
+  p.ransac_correspondence_randomness =
+    declare_parameter<int>("ransac_correspondence_randomness", 5);
+  p.ransac_similarity_threshold = declare_parameter<double>("ransac_similarity_threshold", 0.9);
+  p.ransac_max_correspondence_distance =
+    declare_parameter<double>("ransac_max_correspondence_distance", 0.25);
+  p.ransac_inlier_fraction = declare_parameter<double>("ransac_inlier_fraction", 0.25);
+
+  p.sac_ia_max_iterations = declare_parameter<int>("sac_ia_max_iterations", 1000);
+  p.sac_ia_num_samples = declare_parameter<int>("sac_ia_num_samples", 3);
+  p.sac_ia_correspondence_randomness =
+    declare_parameter<int>("sac_ia_correspondence_randomness", 10);
+  p.sac_ia_min_sample_distance = declare_parameter<double>("sac_ia_min_sample_distance", 0.5);
+  p.sac_ia_max_correspondence_distance =
+    declare_parameter<double>("sac_ia_max_correspondence_distance", 0.5);
 
   p.icp_refine = declare_parameter<bool>("icp_refine", true);
   p.icp_max_iterations = declare_parameter<int>("icp_max_iterations", 50);
@@ -293,6 +312,87 @@ std::optional<Eigen::Isometry3d> GlobalRegistrationNode::refine_icp(
     guess = icp.getFinalTransformation();
   }
   return to_isometry(guess);
+}
+
+GlobalRegistrationNode::GlobalAttempt GlobalRegistrationNode::global_attempt(
+  const PreparedCloud & source, const PreparedCloud & target) const
+{
+  GlobalAttempt out;
+  const auto t_global = Clock::now();
+  Cloud global_aligned;
+  if (params_.global_method == "ransac") {
+    // Prerejective RANSAC: picks `num_samples` ZED points, matches each to one
+    // of its `correspondence_randomness` most similar Ouster FPFH descriptors,
+    // and discards the sample unless the two triangles have similar edge
+    // lengths (`similarity_threshold`) before paying for a full evaluation. A
+    // pose is accepted only if `inlier_fraction` of the ZED points then lie
+    // within `max_correspondence_distance` of an Ouster point.
+    pcl::SampleConsensusPrerejective<PointT, PointT, pcl::FPFHSignature33> ransac;
+    ransac.setInputSource(source.points);
+    ransac.setSourceFeatures(source.features);
+    ransac.setInputTarget(target.points);
+    ransac.setTargetFeatures(target.features);
+    ransac.setMaximumIterations(params_.ransac_max_iterations);
+    ransac.setNumberOfSamples(params_.ransac_num_samples);
+    ransac.setCorrespondenceRandomness(params_.ransac_correspondence_randomness);
+    ransac.setSimilarityThreshold(static_cast<float>(params_.ransac_similarity_threshold));
+    ransac.setMaxCorrespondenceDistance(params_.ransac_max_correspondence_distance);
+    ransac.setInlierFraction(static_cast<float>(params_.ransac_inlier_fraction));
+    ransac.align(global_aligned);
+    out.global_s = seconds_since(t_global);
+    if (!ransac.hasConverged()) {return out;}
+    out.correction = to_isometry(ransac.getFinalTransformation());
+  } else {
+    // SAC-IA: repeatedly picks `num_samples` ZED points at least
+    // `min_sample_distance` apart, matches each to one of its
+    // `correspondence_randomness` most similar Ouster FPFH descriptors, solves
+    // the rigid transform and keeps the best one over all iterations.
+    pcl::SampleConsensusInitialAlignment<PointT, PointT, pcl::FPFHSignature33> sac;
+    sac.setInputSource(source.points);
+    sac.setSourceFeatures(source.features);
+    sac.setInputTarget(target.points);
+    sac.setTargetFeatures(target.features);
+    sac.setMaximumIterations(params_.sac_ia_max_iterations);
+    sac.setNumberOfSamples(params_.sac_ia_num_samples);
+    sac.setCorrespondenceRandomness(params_.sac_ia_correspondence_randomness);
+    sac.setMinSampleDistance(static_cast<float>(params_.sac_ia_min_sample_distance));
+    sac.setMaxCorrespondenceDistance(params_.sac_ia_max_correspondence_distance);
+    sac.align(global_aligned);
+    out.global_s = seconds_since(t_global);
+    if (!sac.hasConverged()) {return out;}
+    out.correction = to_isometry(sac.getFinalTransformation());
+  }
+  out.converged = true;
+  out.global_inliers = inlier_ratio(global_aligned, target.points, params_.inlier_distance);
+  out.final_inliers = out.global_inliers;
+
+  // Optional local refinement: ICP seeded with the global result
+  std::ostringstream icp_note;
+  icp_note << std::fixed;
+  if (params_.icp_refine) {
+    const auto t_icp = Clock::now();
+    pcl::IterativeClosestPoint<PointT, PointT> icp;
+    icp.setInputSource(source.points);
+    icp.setInputTarget(target.points);
+    icp.setMaxCorrespondenceDistance(params_.icp_max_correspondence_distance);
+    icp.setMaximumIterations(params_.icp_max_iterations);
+    icp.setTransformationEpsilon(1e-8);
+    icp.setEuclideanFitnessEpsilon(1e-6);
+    Cloud icp_aligned;
+    icp.align(icp_aligned, out.correction.matrix().cast<float>());
+    if (icp.hasConverged()) {
+      out.correction = to_isometry(icp.getFinalTransformation());
+      out.final_inliers = inlier_ratio(icp_aligned, target.points, params_.inlier_distance);
+      icp_note << std::setprecision(1) << 100.0 * out.final_inliers << "% inliers ("
+               << std::setprecision(2) << seconds_since(t_icp) << " s)";
+    } else {
+      icp_note << "did not converge, keeping the global result";
+    }
+  } else {
+    icp_note << "disabled";
+  }
+  out.icp_note = icp_note.str();
+  return out;
 }
 
 double GlobalRegistrationNode::inlier_ratio(const Cloud & source, const Cloud::ConstPtr & target,
@@ -562,13 +662,15 @@ void GlobalRegistrationNode::on_clouds(const CloudMsg::ConstSharedPtr & ouster_m
     return;
   }
 
-  // ==== Global stage: voxel grid, normals, FPFH, SAC-IA, ICP ====================
+  // ==== Global stage: voxel grid, normals, FPFH, RANSAC / SAC-IA, ICP ===========
   const auto target = prepare(ouster_cloud, base_T_ouster_cloud->translation());
   const auto source = prepare(zed_cloud, base_T_zed_cloud->translation());
   const double t_features = seconds_since(t_start);
 
-  if (static_cast<int>(source.points->size()) < params_.sac_num_samples ||
-    static_cast<int>(target.points->size()) < params_.sac_num_samples)
+  const int num_samples = params_.global_method == "ransac" ?
+    params_.ransac_num_samples : params_.sac_ia_num_samples;
+  if (static_cast<int>(source.points->size()) < num_samples ||
+    static_cast<int>(target.points->size()) < num_samples)
   {
     RCLCPP_WARN(get_logger(), "Not enough points with valid features (zed %zu, ouster %zu); "
                 "check the range limits and voxel/feature radii",
@@ -576,59 +678,35 @@ void GlobalRegistrationNode::on_clouds(const CloudMsg::ConstSharedPtr & ouster_m
     return;
   }
 
-  // ---- 4. Global alignment: SAC-IA ------------------------------------------
-  // Repeatedly picks `num_samples` ZED points at least `min_sample_distance`
-  // apart, matches each to one of its `correspondence_randomness` most similar
-  // Ouster FPFH descriptors, solves the rigid transform and keeps the best.
-  const auto t_sac = Clock::now();
-  pcl::SampleConsensusInitialAlignment<PointT, PointT, pcl::FPFHSignature33> sac;
-  sac.setInputSource(source.points);
-  sac.setSourceFeatures(source.features);
-  sac.setInputTarget(target.points);
-  sac.setTargetFeatures(target.features);
-  sac.setMaximumIterations(params_.sac_max_iterations);
-  sac.setNumberOfSamples(params_.sac_num_samples);
-  sac.setCorrespondenceRandomness(params_.sac_correspondence_randomness);
-  sac.setMinSampleDistance(static_cast<float>(params_.sac_min_sample_distance));
-  sac.setMaxCorrespondenceDistance(params_.sac_max_correspondence_distance);
-  Cloud sac_aligned;
-  sac.align(sac_aligned);
-  if (!sac.hasConverged()) {
-    RCLCPP_WARN(get_logger(), "SAC-IA did not converge, retrying on the next pair");
+  // ---- 4. Global alignment: parallel RANSAC or SAC-IA + ICP -----------------
+  // Independent randomized attempts on the same pair, one per thread; the one
+  // with the best overlap after ICP is this run's estimate. Only one estimate
+  // per pair enters the consensus, so agreement still requires distinct pairs.
+  const auto t_global = Clock::now();
+  const int n_attempts = std::max(1, params_.global_attempts);
+  std::vector<std::future<GlobalAttempt>> futures;
+  for (int i = 0; i < n_attempts; ++i) {
+    futures.push_back(std::async(std::launch::async,
+                                 [this, &source, &target] {return global_attempt(source, target);}));
+  }
+  std::vector<GlobalAttempt> attempts;
+  for (auto & f : futures) {attempts.push_back(f.get());}
+  const double t_global_s = seconds_since(t_global);
+
+  const GlobalAttempt * best = nullptr;
+  int n_converged = 0;
+  for (const auto & a : attempts) {
+    if (!a.converged) {continue;}
+    ++n_converged;
+    if (!best || a.final_inliers > best->final_inliers) {best = &a;}
+  }
+  if (!best) {
+    RCLCPP_WARN(get_logger(), "None of the %d global alignment attempts converged, retrying on "
+                "the next pair", n_attempts);
     return;
   }
-  Eigen::Isometry3d correction = to_isometry(sac.getFinalTransformation());
-  const double sac_fitness = sac.getFitnessScore(params_.sac_max_correspondence_distance);
-  const double sac_inliers = inlier_ratio(sac_aligned, target.points, params_.inlier_distance);
-  const double t_sac_s = seconds_since(t_sac);
-
-  // ---- Optional local refinement: ICP seeded with the SAC-IA result ---------
-  std::ostringstream icp_line;
-  double final_inliers = sac_inliers;
-  if (params_.icp_refine) {
-    const auto t_icp = Clock::now();
-    pcl::IterativeClosestPoint<PointT, PointT> icp;
-    icp.setInputSource(source.points);
-    icp.setInputTarget(target.points);
-    icp.setMaxCorrespondenceDistance(params_.icp_max_correspondence_distance);
-    icp.setMaximumIterations(params_.icp_max_iterations);
-    icp.setTransformationEpsilon(1e-8);
-    icp.setEuclideanFitnessEpsilon(1e-6);
-    Cloud icp_aligned;
-    icp.align(icp_aligned, correction.matrix().cast<float>());
-    if (icp.hasConverged()) {
-      correction = to_isometry(icp.getFinalTransformation());
-      final_inliers = inlier_ratio(icp_aligned, target.points, params_.inlier_distance);
-      icp_line << std::fixed << std::setprecision(4) << "converged, fitness "
-               << icp.getFitnessScore(params_.icp_max_correspondence_distance) << " m^2, "
-               << std::setprecision(1) << 100.0 * final_inliers << "% inliers, "
-               << std::setprecision(2) << seconds_since(t_icp) << " s";
-    } else {
-      icp_line << "did not converge, keeping the SAC-IA result";
-    }
-  } else {
-    icp_line << "disabled";
-  }
+  const Eigen::Isometry3d correction = best->correction;
+  const double final_inliers = best->final_inliers;
 
   // ---- Corrected sensor poses -----------------------------------------------
   const Eigen::Isometry3d estimate = to_estimate(correction);
@@ -645,10 +723,12 @@ void GlobalRegistrationNode::on_clouds(const CloudMsg::ConstSharedPtr & ouster_m
       << "                   zed    " << zed_msg->width * zed_msg->height << " raw -> "
       << zed_cloud->size() << " cropped -> " << source.points->size() << " with features\n"
       << std::setprecision(2) << "  features       : " << t_features << " s\n"
-      << std::setprecision(4) << "  SAC-IA         : fitness " << sac_fitness << " m^2, "
-      << std::setprecision(1) << 100.0 * sac_inliers << "% inliers, "
-      << std::setprecision(2) << t_sac_s << " s\n"
-      << "  ICP            : " << icp_line.str() << "\n"
+      << "  global search  : " << n_converged << " of " << n_attempts
+      << " parallel attempts converged, " << std::setprecision(2) << t_global_s << " s\n"
+      << std::setprecision(1) << "  best attempt   : "
+      << (params_.global_method == "ransac" ? "RANSAC " : "SAC-IA ") << 100.0 * best->global_inliers
+      << "% inliers (" << std::setprecision(2) << best->global_s << " s), ICP "
+      << best->icp_note << "\n"
       << std::setprecision(3) << "  correction     : " << correction.translation().norm()
       << " m, " << std::setprecision(2) << delta_rot.angle() * 180.0 / M_PI << " deg"
       << "  (~0 once the launch poses are right)\n"
