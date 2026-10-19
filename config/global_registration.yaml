@@ -28,19 +28,32 @@ global_registration:
     feature_radius: 0.6  # ~2x normal_radius
     num_threads: 0       # 0 = all cores
 
-    # SAC-IA
-    sac_max_iterations: 1000
-    sac_num_samples: 3
-    sac_correspondence_randomness: 10
-    sac_min_sample_distance: 0.5
-    sac_max_correspondence_distance: 0.5
+    # Global alignment on FPFH matches, run as global_attempts parallel
+    # attempts per pair; the best one is kept
+    global_method: ransac  # ransac (prerejective RANSAC) or sac_ia
+    global_attempts: 4
 
-    # ICP refinement seeded with the SAC-IA result
+    # global_method: ransac
+    ransac_max_iterations: 50000
+    ransac_num_samples: 3
+    ransac_correspondence_randomness: 5
+    ransac_similarity_threshold: 0.9          # reject samples whose triangles differ more
+    ransac_max_correspondence_distance: 0.25  # ~2.5x voxel_leaf_size
+    ransac_inlier_fraction: 0.25              # share of ZED points that must match
+
+    # global_method: sac_ia
+    sac_ia_max_iterations: 1000
+    sac_ia_num_samples: 3
+    sac_ia_correspondence_randomness: 10
+    sac_ia_min_sample_distance: 0.5
+    sac_ia_max_correspondence_distance: 0.5
+
+    # ICP refinement seeded with each global result
     icp_refine: true
     icp_max_iterations: 50
     icp_max_correspondence_distance: 0.3
 
-    # Once the global stage has a consensus (min_agreeing_runs), skip SAC-IA and
+    # Once the global stage has a consensus (min_agreeing_runs), skip it and
     # refine each new pair with coarse-to-fine point-to-plane ICP seeded from it
     refine: true
     refine_voxel_leaf_size: 0.05
