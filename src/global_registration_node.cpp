@@ -633,11 +633,12 @@ void GlobalRegistrationNode::on_clouds(const CloudMsg::ConstSharedPtr & ouster_m
         << 1000.0 * result.translation_std << " mm / " << std::setprecision(2)
         << result.rotation_std * 180.0 / M_PI << " deg RMS\n";
     const bool trusted = result.count >= static_cast<std::size_t>(params_.min_agreeing_runs);
+    bool saved = false;
     if (!trusted) {
       out << "  (not reliable yet: waiting for at least " << params_.min_agreeing_runs
           << " agreeing refined runs)\n";
     } else if (!params_.calibration_file.empty() &&
-      save_calibration(new_base_T_ouster, new_base_T_zed, result, "refined"))
+      (saved = save_calibration(new_base_T_ouster, new_base_T_zed, result, "refined")))
     {
       out << "  saved to       : " << params_.calibration_file << "\n";
     }
@@ -647,7 +648,8 @@ void GlobalRegistrationNode::on_clouds(const CloudMsg::ConstSharedPtr & ouster_m
         << "      " << pose_as_launch_args("zed", new_base_T_zed) << "\n";
     RCLCPP_INFO(get_logger(), "%s", out.str().c_str());
 
-    if (params_.target_agreeing_runs > 0 &&
+    if (trusted && (params_.calibration_file.empty() || saved) &&
+      params_.target_agreeing_runs > 0 &&
       result.count >= static_cast<std::size_t>(params_.target_agreeing_runs))
     {
       done_ = true;

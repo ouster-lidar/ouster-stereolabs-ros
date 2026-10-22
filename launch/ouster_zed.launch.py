@@ -158,7 +158,7 @@ def zed_camera(context):
         'publish_tf': 'false',
     }
     overrides = LaunchConfiguration('zed_param_overrides').perform(context)
-    if not overrides and LaunchConfiguration('register').perform(context).lower() == 'true':
+    if not overrides and IfCondition(LaunchConfiguration('register')).evaluate(context):
         overrides = REGISTRATION_ZED_OVERRIDES
     launch_arguments['param_overrides'] = overrides
     if zone_monitor_config(context):
