@@ -23,7 +23,8 @@ With zone_monitor_config_file:=<zip> the Ouster zone monitor configuration is
 uploaded to the lidar and the same zip is loaded by a zed_zone_monitor node,
 which turns on ZED object detection. Both express the zones in os_sensor, so
 the lidar's zone markers and the camera's land on the same volumes through the
-calibration above.
+calibration above. zone_monitor_inclusion picks which part of a detected object
+has to be in a zone for the camera channel: CENTER, FOOTPRINT or BOUNDING_BOX.
 """
 
 import os
@@ -191,6 +192,7 @@ def zed_zone_monitor(context):
                 'zone_monitor_config_file': path,
                 # the frame ouster-ros renders its zone markers in
                 'zone_monitor_frame_id': 'os_sensor',
+                'zone_monitor_inclusion': LaunchConfiguration('zone_monitor_inclusion'),
                 'cameras': [camera_name],
                 'objects_topics': [f'/{camera_name}/zed_node/obj_det/objects'],
             },
@@ -218,6 +220,11 @@ def generate_launch_description():
             description='Ouster zone monitor configuration zip (metadata.json + STL files). '
                         'When set it is uploaded to the lidar and a zed_zone_monitor node '
                         'monitors the same zones with the ZED detections'),
+        DeclareLaunchArgument(
+            'zone_monitor_inclusion', default_value='CENTER',
+            description='Part of a ZED detection that has to be in a zone: CENTER (centre of '
+                        'its 3D bounding box), FOOTPRINT (centre of the bottom face of the '
+                        'box) or BOUNDING_BOX (any part of the box)'),
         # ZED
         DeclareLaunchArgument('camera_model', default_value='zed2i',
                               description='ZED camera model'),
